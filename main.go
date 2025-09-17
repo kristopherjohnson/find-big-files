@@ -125,7 +125,7 @@ func main() {
 		sizeInfo := formatSize(displaySize)
 
 		if file.IsDirectory {
-			marker += " [DIRECTORY]"
+			marker += " [DIR]"
 			if file.Size != file.ActualSize {
 				sizeInfo = fmt.Sprintf("%s (actual: %s)", formatSize(file.Size), formatSize(file.ActualSize))
 			}
@@ -226,8 +226,8 @@ func processDirectoryConcurrently(ctx context.Context, dirPath string, minSize i
 
 	entries, err := os.ReadDir(dirPath)
 	if err != nil {
-		log.Printf("Warning: could not read directory %s: %v", dirPath, err)
-		return // Skip directories we can't read
+		// Silently skip directories we can't read (e.g., permission denied)
+		return
 	}
 
 	// Semaphore to limit concurrent goroutines
@@ -267,8 +267,8 @@ func processDirectoryConcurrently(ctx context.Context, dirPath string, minSize i
 						// Calculate total directory size
 						totalSize, totalActualSize, newestModTime, err := calculateDirectorySize(ctx, dirPath)
 						if err != nil {
-							log.Printf("Warning: could not calculate directory size for %s: %v", dirPath, err)
-							return // Skip directories we can't process
+							// Silently skip directories we can't process
+							return
 						}
 
 						// Only report if it meets the size threshold
@@ -359,9 +359,8 @@ func processFile(path string, entry fs.DirEntry, minSize int64) *FileInfo {
 			fileInfo.IsDeletable = true
 			fileInfo.Category = "Temporary/Cache"
 			break
-		} else if err != nil {
-			log.Printf("Warning: invalid pattern %s: %v", pattern, err)
 		}
+		// Silently skip invalid patterns (unlikely with our hardcoded patterns)
 	}
 
 	// Check if file is in a deletable directory
