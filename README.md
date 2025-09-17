@@ -81,7 +81,7 @@ Searching for files larger than 1.0 GB in /Users/username...
 
 Top 10 largest files:
 ------------------------------------------------------------------------------------------------------------------------------------
- 1. ~/getditto/ditto/target                                         10.8 GB (actual: 11.0 GB) [LIKELY DELETABLE] [DIRECTORY]
+ 1. ~/work/my-rust-app/target                                         10.8 GB (actual: 11.0 GB) [LIKELY DELETABLE] [DIRECTORY]
     Category: target directory | Modified: 2025-09-16 16:22
  2. ~/Library/Containers/com.docker.docker/Data/vm.../Docker.raw     1.0 TB (actual: 91.6 GB) [SPARSE]
     Category: Virtual Disk/Container | Modified: 2025-09-16 20:51
@@ -89,7 +89,7 @@ Top 10 largest files:
     Category: node_modules directory | Modified: 2024-01-15 14:23
  4. ~/Downloads/macos-installer.dmg                                              1.8 GB [LIKELY DELETABLE]
     Category: Archive/Installer | Modified: 2023-12-01 09:15
- 5. ~/sdks/android/ditto/build                                       1.0 GB (actual: 1.0 GB) [LIKELY DELETABLE] [DIRECTORY]
+ 5. ~/sdks/android/my-app/build                                   1.0 GB (actual: 1.0 GB) [LIKELY DELETABLE] [DIRECTORY]
     Category: build directory | Modified: 2025-09-15 17:28
 ...
 ------------------------------------------------------------------------------------------------------------------------------------
