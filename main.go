@@ -1,12 +1,17 @@
+// Package main provides a utility to find large files on disk with support for
+// sparse file detection, deletable file categorization, and concurrent processing.
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -14,7 +19,8 @@ import (
 	"time"
 )
 
-// FileInfo holds information about a file or directory
+// FileInfo holds information about a file or directory including size,
+// modification time, and categorization metadata.
 type FileInfo struct {
 	Path        string
 	Size        int64
@@ -51,7 +57,11 @@ var skipDirs = []string{
 
 func main() {
 	// Command-line flags
-	homeDir, _ := os.UserHomeDir()
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		log.Printf("Warning: could not get home directory: %v", err)
+		homeDir = "." // fallback to current directory
+	}
 	searchDir := flag.String("dir", homeDir, "Directory to search")
 	minSize := flag.Int64("min-size", 1<<30, "Minimum file size in bytes (default 1GB)")
 	topN := flag.Int("top", 20, "Number of files to display")
@@ -66,7 +76,14 @@ func main() {
 	}
 	fmt.Println()
 
-	files := findLargeFiles(*searchDir, *minSize)
+	// Create context with timeout for the operation
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	files, err := findLargeFiles(ctx, *searchDir, *minSize)
+	if err != nil {
+		log.Fatalf("Error searching for files: %v", err)
+	}
 
 	// Sort by actual disk usage (largest first)
 	// For sparse files, this shows true disk impact; for regular files, it's the same as file size
@@ -99,8 +116,8 @@ func main() {
 		}
 
 		relPath := file.Path
-		if strings.HasPrefix(file.Path, homeDir) {
-			relPath = "~" + strings.TrimPrefix(file.Path, homeDir)
+		if after, found := strings.CutPrefix(file.Path, homeDir); found {
+			relPath = "~" + after
 		}
 
 		// Show actual disk usage for sparse files, apparent size otherwise
@@ -142,40 +159,45 @@ func main() {
 	}
 }
 
-func findLargeFiles(root string, minSize int64) []FileInfo {
+func findLargeFiles(ctx context.Context, root string, minSize int64) ([]FileInfo, error) {
 	// Use number of CPUs for worker pool size, but cap at reasonable limit
-	numWorkers := runtime.NumCPU()
-	if numWorkers > 8 {
-		numWorkers = 8
-	}
+	numWorkers := min(runtime.NumCPU(), 8)
 
-	// Channel for results
-	resultChan := make(chan FileInfo, 1000)
+	// Channel for results - use buffered channel but not too large
+	resultChan := make(chan FileInfo, numWorkers*10)
 
 	// Use a WaitGroup to track all goroutines
 	var wg sync.WaitGroup
 
-	// Start result collector
+	// Collect results
 	var files []FileInfo
 	var mu sync.Mutex
-
-	// Process root directory and spawn workers for subdirectories
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		processDirectoryConcurrently(root, minSize, resultChan, &wg, numWorkers)
-	}()
 
 	// Start result collector in a separate goroutine
 	var collectorWg sync.WaitGroup
 	collectorWg.Add(1)
 	go func() {
 		defer collectorWg.Done()
-		for file := range resultChan {
-			mu.Lock()
-			files = append(files, file)
-			mu.Unlock()
+		for {
+			select {
+			case file, ok := <-resultChan:
+				if !ok {
+					return // Channel closed
+				}
+				mu.Lock()
+				files = append(files, file)
+				mu.Unlock()
+			case <-ctx.Done():
+				return // Context cancelled
+			}
 		}
+	}()
+
+	// Process root directory and spawn workers for subdirectories
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		processDirectoryConcurrently(ctx, root, minSize, resultChan, &wg, numWorkers)
 	}()
 
 	// Wait for all processing to complete, then close result channel
@@ -187,13 +209,24 @@ func findLargeFiles(root string, minSize int64) []FileInfo {
 	// Wait for collector to finish
 	collectorWg.Wait()
 
-	return files
+	// Check if context was cancelled
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+
+	return files, nil
 }
 
 // processDirectoryConcurrently processes a directory and its subdirectories concurrently
-func processDirectoryConcurrently(dirPath string, minSize int64, resultChan chan<- FileInfo, wg *sync.WaitGroup, maxWorkers int) {
+func processDirectoryConcurrently(ctx context.Context, dirPath string, minSize int64, resultChan chan<- FileInfo, wg *sync.WaitGroup, maxWorkers int) {
+	// Check if context is cancelled
+	if ctx.Err() != nil {
+		return
+	}
+
 	entries, err := os.ReadDir(dirPath)
 	if err != nil {
+		log.Printf("Warning: could not read directory %s: %v", dirPath, err)
 		return // Skip directories we can't read
 	}
 
@@ -203,18 +236,19 @@ func processDirectoryConcurrently(dirPath string, minSize int64, resultChan chan
 	var localWg sync.WaitGroup
 
 	for _, entry := range entries {
+		// Check context cancellation in the loop
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
 		path := filepath.Join(dirPath, entry.Name())
 
 		if entry.IsDir() {
 			// Check if we should skip this directory
 			dirName := entry.Name()
-			shouldSkip := false
-			for _, skip := range skipDirs {
-				if dirName == skip {
-					shouldSkip = true
-					break
-				}
-			}
+			shouldSkip := slices.Contains(skipDirs, dirName)
 
 			if !shouldSkip {
 				// Check if this is a deletable directory that should be aggregated
@@ -231,8 +265,9 @@ func processDirectoryConcurrently(dirPath string, minSize int64, resultChan chan
 						sem <- struct{}{} // Acquire semaphore
 
 						// Calculate total directory size
-						totalSize, totalActualSize, newestModTime, err := calculateDirectorySize(dirPath)
+						totalSize, totalActualSize, newestModTime, err := calculateDirectorySize(ctx, dirPath)
 						if err != nil {
+							log.Printf("Warning: could not calculate directory size for %s: %v", dirPath, err)
 							return // Skip directories we can't process
 						}
 
@@ -250,8 +285,8 @@ func processDirectoryConcurrently(dirPath string, minSize int64, resultChan chan
 
 							select {
 							case resultChan <- dirInfo:
-							default:
-								// Result channel full, continue processing
+							case <-ctx.Done():
+								return
 							}
 						}
 					}(path, dirName)
@@ -266,7 +301,7 @@ func processDirectoryConcurrently(dirPath string, minSize int64, resultChan chan
 							<-sem // Release semaphore
 						}()
 						sem <- struct{}{} // Acquire semaphore
-						processDirectoryConcurrently(subPath, minSize, resultChan, wg, maxWorkers)
+						processDirectoryConcurrently(ctx, subPath, minSize, resultChan, wg, maxWorkers)
 					}(path)
 				}
 			}
@@ -275,8 +310,8 @@ func processDirectoryConcurrently(dirPath string, minSize int64, resultChan chan
 			if fileInfo := processFile(path, entry, minSize); fileInfo != nil {
 				select {
 				case resultChan <- *fileInfo:
-				default:
-					// Result channel full, continue processing
+				case <-ctx.Done():
+					return
 				}
 			}
 		}
@@ -320,10 +355,12 @@ func processFile(path string, entry fs.DirEntry, minSize int64) *FileInfo {
 	// Check if file matches deletable patterns
 	fileName := filepath.Base(path)
 	for _, pattern := range deletablePatterns {
-		if matched, _ := filepath.Match(pattern, fileName); matched {
+		if matched, err := filepath.Match(pattern, fileName); err == nil && matched {
 			fileInfo.IsDeletable = true
 			fileInfo.Category = "Temporary/Cache"
 			break
+		} else if err != nil {
+			log.Printf("Warning: invalid pattern %s: %v", pattern, err)
 		}
 	}
 
@@ -419,8 +456,9 @@ func truncatePath(path string, maxLen int) string {
 	return path[:maxLen-3] + "..."
 }
 
-// getActualDiskUsage returns the actual disk usage for a file using syscall.Stat
-// On macOS, this calculates actual size = blocks * 512 bytes
+// getActualDiskUsage returns the actual disk usage for a file using syscall.Stat.
+// On macOS and Linux, this calculates actual size = blocks * 512 bytes.
+// This helps detect sparse files where apparent size differs from actual disk usage.
 func getActualDiskUsage(path string) (int64, error) {
 	var stat syscall.Stat_t
 	err := syscall.Stat(path, &stat)
@@ -428,7 +466,7 @@ func getActualDiskUsage(path string) (int64, error) {
 		return 0, err
 	}
 
-	// On macOS, stat.Blocks is in 512-byte units
+	// On macOS and Linux, stat.Blocks is in 512-byte units
 	return stat.Blocks * 512, nil
 }
 
@@ -467,18 +505,30 @@ func isKnownSparseFile(path string) bool {
 }
 
 // calculateDirectorySize recursively calculates the total size of all files in a directory
-func calculateDirectorySize(dirPath string) (int64, int64, time.Time, error) {
+func calculateDirectorySize(ctx context.Context, dirPath string) (int64, int64, time.Time, error) {
 	var totalSize int64
 	var totalActualSize int64
 	var newestModTime time.Time
 
-	err := filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
+	err := filepath.WalkDir(dirPath, func(path string, d fs.DirEntry, err error) error {
+		// Check for context cancellation
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		if err != nil {
 			// Skip files we can't access
 			return nil
 		}
 
-		if !info.IsDir() {
+		if !d.IsDir() {
+			info, err := d.Info()
+			if err != nil {
+				return nil // Skip files we can't stat
+			}
+
 			totalSize += info.Size()
 
 			// Get actual disk usage
@@ -501,10 +551,5 @@ func calculateDirectorySize(dirPath string) (int64, int64, time.Time, error) {
 
 // isDeletableDir checks if a directory name matches any of the deletable directory patterns
 func isDeletableDir(dirName string) bool {
-	for _, dir := range deletableDirs {
-		if dirName == dir {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(deletableDirs, dirName)
 }
