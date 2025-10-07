@@ -11,7 +11,15 @@ A fast Go command-line tool to find large files on your system, with special att
 - **Flexible filtering** - Customizable size thresholds and result limits
 - **Wide terminal support** - Optimized for 132+ character wide terminals
 
-## Building
+## Installation
+
+Install directly using Go:
+
+```bash
+go install github.com/kristopherjohnson/find-big-files@latest
+```
+
+Or build from source:
 
 ```bash
 go build -o find-big-files
@@ -21,22 +29,22 @@ go build -o find-big-files
 
 ```bash
 # Find files larger than 1GB in your home directory (default)
-./find-big-files
+find-big-files
 
 # Search a specific directory
-./find-big-files -dir /path/to/directory
+find-big-files -dir /path/to/directory
 
 # Find files larger than 500MB
-./find-big-files -min-size 524288000
+find-big-files -min-size 524288000
 
 # Show top 50 files instead of default 20
-./find-big-files -top 50
+find-big-files -top 50
 
 # Show all large files regardless of type
-./find-big-files -all
+find-big-files -all
 
 # Don't highlight deletable files
-./find-big-files -deletable=false
+find-big-files -deletable=false
 ```
 
 ## Command-line Options
