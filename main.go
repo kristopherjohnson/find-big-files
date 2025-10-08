@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/trace"
 	"slices"
 	"sort"
 	"strings"
@@ -56,19 +57,42 @@ var skipDirs = []string{
 }
 
 func main() {
+	defer trace.StartRegion(context.Background(), "app/main").End()
+
 	// Command-line flags
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		log.Printf("Warning: could not get home directory: %v", err)
 		homeDir = "." // fallback to current directory
 	}
+
 	searchDir := flag.String("dir", homeDir, "Directory to search")
 	minSize := flag.Int64("min-size", 1<<30, "Minimum file size in bytes (default 1GB)")
 	topN := flag.Int("top", 20, "Number of files to display")
 	showAll := flag.Bool("all", false, "Show all large files regardless of type")
 	showDeletable := flag.Bool("deletable", true, "Highlight potentially deletable files")
+	tracePath := flag.String("trace", "", "Enable tracing and write trace output to the specified file")
 
 	flag.Parse()
+
+	// Setup tracing if requested
+	if *tracePath != "" {
+		f, err := os.Create(*tracePath)
+		if err != nil {
+			log.Fatalf("failed to create trace output file: %v", err)
+		}
+		defer func() {
+			if err := f.Close(); err != nil {
+				log.Fatalf("failed to close trace file: %v", err)
+			}
+		}()
+
+		if err := trace.Start(f); err != nil {
+			log.Fatalf("failed to start trace: %v", err)
+		}
+		defer trace.Stop()
+		fmt.Printf("Tracing enabled, output will be written to: %s\n", *tracePath)
+	}
 
 	fmt.Printf("Searching for files larger than %s in %s...\n", formatSize(*minSize), *searchDir)
 	if !*showAll {
@@ -87,9 +111,11 @@ func main() {
 
 	// Sort by actual disk usage (largest first)
 	// For sparse files, this shows true disk impact; for regular files, it's the same as file size
+	reg := trace.StartRegion(ctx, "app/main/sort")
 	sort.Slice(files, func(i, j int) bool {
 		return files[i].ActualSize > files[j].ActualSize
 	})
+	reg.End()
 
 	// Limit to top N
 	if len(files) > *topN {
@@ -160,6 +186,8 @@ func main() {
 }
 
 func findLargeFiles(ctx context.Context, root string, minSize int64) ([]FileInfo, error) {
+	defer trace.StartRegion(ctx, "app/findLargeFiles").End()
+
 	// Use number of CPUs for worker pool size, but cap at reasonable limit
 	numWorkers := min(runtime.NumCPU(), 8)
 
@@ -177,6 +205,7 @@ func findLargeFiles(ctx context.Context, root string, minSize int64) ([]FileInfo
 	var collectorWg sync.WaitGroup
 	collectorWg.Add(1)
 	go func() {
+		defer trace.StartRegion(ctx, "app/findLargeFiles/append").End()
 		defer collectorWg.Done()
 		for {
 			select {
@@ -202,12 +231,15 @@ func findLargeFiles(ctx context.Context, root string, minSize int64) ([]FileInfo
 
 	// Wait for all processing to complete, then close result channel
 	go func() {
+		defer trace.StartRegion(ctx, "app/findLargeFiles/wg.Wait").End()
 		wg.Wait()
 		close(resultChan)
 	}()
 
 	// Wait for collector to finish
+	reg := trace.StartRegion(ctx, "app/findLargeFiles/collectorWg.Wait")
 	collectorWg.Wait()
+	reg.End()
 
 	// Check if context was cancelled
 	if ctx.Err() != nil {
@@ -219,6 +251,9 @@ func findLargeFiles(ctx context.Context, root string, minSize int64) ([]FileInfo
 
 // processDirectoryConcurrently processes a directory and its subdirectories concurrently
 func processDirectoryConcurrently(ctx context.Context, dirPath string, minSize int64, resultChan chan<- FileInfo, wg *sync.WaitGroup, maxWorkers int) {
+	defer trace.StartRegion(ctx, "app/processDirectoryConcurrently").End()
+	defer trace.Logf(ctx, "app", "processDirectoryConcurrently %s", dirPath)
+
 	// Check if context is cancelled
 	if ctx.Err() != nil {
 		return
@@ -257,6 +292,7 @@ func processDirectoryConcurrently(ctx context.Context, dirPath string, minSize i
 					localWg.Add(1)
 					wg.Add(1)
 					go func(dirPath string, dirName string) {
+						trace.StartRegion(ctx, "app/processDirectoryConcurrently/deletable").End()
 						defer func() {
 							localWg.Done()
 							wg.Done()
@@ -295,6 +331,7 @@ func processDirectoryConcurrently(ctx context.Context, dirPath string, minSize i
 					localWg.Add(1)
 					wg.Add(1)
 					go func(subPath string) {
+						trace.StartRegion(ctx, "app/processDirectoryConcurrently/normal").End()
 						defer func() {
 							localWg.Done()
 							wg.Done()
@@ -307,7 +344,7 @@ func processDirectoryConcurrently(ctx context.Context, dirPath string, minSize i
 			}
 		} else {
 			// Process file
-			if fileInfo := processFile(path, entry, minSize); fileInfo != nil {
+			if fileInfo := processFile(ctx, path, entry, minSize); fileInfo != nil {
 				select {
 				case resultChan <- *fileInfo:
 				case <-ctx.Done():
@@ -322,7 +359,10 @@ func processDirectoryConcurrently(ctx context.Context, dirPath string, minSize i
 }
 
 // processFile processes a single file and returns FileInfo if it meets criteria
-func processFile(path string, entry fs.DirEntry, minSize int64) *FileInfo {
+func processFile(ctx context.Context, path string, entry fs.DirEntry, minSize int64) *FileInfo {
+	defer trace.StartRegion(ctx, "app/processFile").End()
+	trace.Logf(ctx, "app", "processFile: %s", path)
+
 	info, err := entry.Info()
 	if err != nil {
 		return nil
@@ -505,11 +545,15 @@ func isKnownSparseFile(path string) bool {
 
 // calculateDirectorySize recursively calculates the total size of all files in a directory
 func calculateDirectorySize(ctx context.Context, dirPath string) (int64, int64, time.Time, error) {
+	defer trace.StartRegion(ctx, "app/calculateDirectorySize").End()
+	trace.Logf(ctx, "app", "calculateDirectorySize %s", dirPath)
+
 	var totalSize int64
 	var totalActualSize int64
 	var newestModTime time.Time
 
 	err := filepath.WalkDir(dirPath, func(path string, d fs.DirEntry, err error) error {
+		trace.StartRegion(ctx, "app/calculateDirectorySize/WalkDir").End()
 		// Check for context cancellation
 		select {
 		case <-ctx.Done():
